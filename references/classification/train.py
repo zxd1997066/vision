@@ -13,6 +13,8 @@ from sampler import RASampler
 from torch import nn
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
 from transforms import get_mixup_cutmix
 
 
@@ -61,15 +63,33 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
 
 def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
     model.eval()
+    if args.compile:
+        if args.compile_backend == "cudagraphs":
+            model = torch.compile(model, backend=args.compile_backend)
+        elif args.max_autotune:
+            model = torch.compile(model, mode='max-autotune')
+        else:
+            model = torch.compile(model, backend=args.compile_backend, options={"freezing": True})
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = f"Test: {log_suffix}"
 
     num_processed_samples = 0
     with torch.inference_mode():
+        total_time = 0.0
+        total_sample = 0
+        i = 0
         for image, target in metric_logger.log_every(data_loader, print_freq, header):
+            if args.num_iter > 0 and i >= args.num_iter: break
             image = image.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            if args.channels_last:
+                model = model.to(memory_format=torch.channels_last)
+                criterion = criterion.to(memory_format=torch.channels_last)
+                image = image.contiguous(memory_format=torch.channels_last)
+            elapsed = time.time()
             output = model(image)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            elapsed = time.time() - elapsed
             loss = criterion(output, target)
 
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
@@ -79,22 +99,31 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
             metric_logger.update(loss=loss.item())
             metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
             metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
+            print("Iteration: {}, inference time: {} sec.".format(i, elapsed), flush=True)
+            if i >= args.num_warmup:
+                total_time += elapsed
+                total_sample += batch_size
             num_processed_samples += batch_size
+            i = i + 1
+        throughput = total_sample / total_time
+        latency = total_time / total_sample * 1000
+        print('inference latency: %f ms' % latency)
+        print('inference Throughput: %3f images/s' % throughput)
     # gather the stats from all processes
 
     num_processed_samples = utils.reduce_across_processes(num_processed_samples)
-    if (
-        hasattr(data_loader.dataset, "__len__")
-        and len(data_loader.dataset) != num_processed_samples
-        and torch.distributed.get_rank() == 0
-    ):
-        # See FIXME above
-        warnings.warn(
-            f"It looks like the dataset has {len(data_loader.dataset)} samples, but {num_processed_samples} "
-            "samples were used for the validation, which might bias the results. "
-            "Try adjusting the batch size and / or the world size. "
-            "Setting the world size to 1 is always a safe bet."
-        )
+    # if (
+    #     hasattr(data_loader.dataset, "__len__")
+    #     and len(data_loader.dataset) != num_processed_samples
+    #     and torch.distributed.get_rank() == 0
+    # ):
+    #     # See FIXME above
+    #     warnings.warn(
+    #         f"It looks like the dataset has {len(data_loader.dataset)} samples, but {num_processed_samples} "
+    #         "samples were used for the validation, which might bias the results. "
+    #         "Try adjusting the batch size and / or the world size. "
+    #         "Setting the world size to 1 is always a safe bet."
+    #     )
 
     metric_logger.synchronize_between_processes()
 
@@ -124,7 +153,10 @@ def load_data(traindir, valdir, args):
     print("Loading training data")
     st = time.time()
     cache_path = _get_cache_path(traindir)
-    if args.cache_dataset and os.path.exists(cache_path):
+    if args.dummy:
+        print("=> Dummy data is used!")
+        dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
+    elif args.cache_dataset and os.path.exists(cache_path):
         # Attention, as the transforms are also cached!
         print(f"Loading dataset_train from {cache_path}")
         # TODO: this could probably be weights_only=True
@@ -157,7 +189,10 @@ def load_data(traindir, valdir, args):
 
     print("Loading validation data")
     cache_path = _get_cache_path(valdir)
-    if args.cache_dataset and os.path.exists(cache_path):
+    if args.dummy:
+        print("=> Dummy data is used!")
+        dataset_test = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
+    elif args.cache_dataset and os.path.exists(cache_path):
         # Attention, as the transforms are also cached!
         print(f"Loading dataset_test from {cache_path}")
         # TODO: this could probably be weights_only=True
@@ -220,7 +255,8 @@ def main(args):
     val_dir = os.path.join(args.data_path, "val")
     dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, args)
 
-    num_classes = len(dataset.classes)
+    #num_classes = len(dataset.classes)
+    num_classes = len(dataset)
     mixup_cutmix = get_mixup_cutmix(
         mixup_alpha=args.mixup_alpha, cutmix_alpha=args.cutmix_alpha, num_classes=num_classes, use_v2=args.use_v2
     )
@@ -354,10 +390,29 @@ def main(args):
         # We disable the cudnn benchmarking because it can noticeably affect the accuracy
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
-        if model_ema:
-            evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+        if torch.cuda.is_available():
+            device_type="cuda"
         else:
-            evaluate(model, criterion, data_loader_test, device=device)
+            device_type="cpu"
+        if args.precision == "bfloat16":
+            print('---- Enable AMP bfloat16')
+            with torch.autocast(device_type=device_type, enabled=True, dtype=torch.bfloat16):
+                if model_ema:
+                    evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+                else:
+                    evaluate(model, criterion, data_loader_test, device=device)
+        elif args.precision == "float16":
+            print('---- Enable AMP float16')
+            with torch.autocast(device_type=device_type, enabled=True, dtype=torch.half):
+                if model_ema:
+                    evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+                else:
+                    evaluate(model, criterion, data_loader_test, device=device)
+        else:
+            if model_ema:
+                    evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+            else:
+                evaluate(model, criterion, data_loader_test, device=device)
         return
 
     print("Start training")
@@ -367,9 +422,22 @@ def main(args):
             train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
         lr_scheduler.step()
-        evaluate(model, criterion, data_loader_test, device=device)
-        if model_ema:
-            evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+        if args.precision == "bfloat16":
+            print('---- Enable AMP bfloat16')
+            with torch.autocast(device_type=device, enabled=True, dtype=torch.bfloat16):
+                evaluate(model, criterion, data_loader_test, device=device)
+                if model_ema:
+                    evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+        elif args.precision == "float16":
+            print('---- Enable AMP float16')
+            with torch.autocast(device_type=device, enabled=True, dtype=torch.half):
+                evaluate(model, criterion, data_loader_test, device=device)
+                if model_ema:
+                    evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+        else:
+            evaluate(model, criterion, data_loader_test, device=device)
+            if model_ema:
+                evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
         if args.output_dir:
             checkpoint = {
                 "model": model_without_ddp.state_dict(),
@@ -408,6 +476,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--opt", default="sgd", type=str, help="optimizer")
     parser.add_argument("--lr", default=0.1, type=float, help="initial learning rate")
     parser.add_argument("--momentum", default=0.9, type=float, metavar="M", help="momentum")
+    parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
     parser.add_argument(
         "--wd",
         "--weight-decay",
@@ -478,7 +547,11 @@ def get_args_parser(add_help=True):
 
     # Mixed precision training parameters
     parser.add_argument("--amp", action="store_true", help="Use torch.cuda.amp for mixed precision training")
-
+    parser.add_argument('--precision', type=str, default='float32', help='precision')
+    parser.add_argument('--channels_last', type=int, default=1, help='use channels last format')
+    parser.add_argument('--max_autotune', action="store_true", help='enable max_autotune')
+    parser.add_argument('--num_iter', type=int, default=-1, help='num_iter')
+    parser.add_argument('--num_warmup', type=int, default=-1, help='num_warmup')
     # distributed training parameters
     parser.add_argument("--world-size", default=1, type=int, help="number of distributed processes")
     parser.add_argument("--dist-url", default="env://", type=str, help="url used to set up distributed training")
@@ -520,6 +593,8 @@ def get_args_parser(add_help=True):
     parser.add_argument("--weights", default=None, type=str, help="the weights enum name to load")
     parser.add_argument("--backend", default="PIL", type=str.lower, help="PIL or tensor - case insensitive")
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
+    parser.add_argument("--compile", action='store_true', default=False, help="enable torch.compile")
+    parser.add_argument("--compile-backend", type=str, default='inductor', help="enable torch.compile backend")
     return parser
 
 
